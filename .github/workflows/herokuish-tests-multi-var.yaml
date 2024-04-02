@@ -1,0 +1,188 @@
+
+# This is only for frameworks that really don't support DATABASE_URL. The next version of laravel for exmaple does.
+name: Test using herokuish (DB credentials in multiple environment variables)
+on:
+  workflow_call:  
+    inputs:
+      registry_root:
+        required: true
+        type: string
+      image_tagged:
+        required: false
+        type: string
+        description: Deprecated, use image_name
+      image_name:
+        required: false
+        type: string
+      default_port:
+        required: true
+        type: string
+      fetch-depth:
+        required: false
+        type: number
+        default: 0
+      herokuish_base_image:
+        required: false
+        type: string
+        default: gliderlabs/herokuish:latest-22
+      BUILDPACK_URL:
+        required: false
+        type: string
+        default: ""
+      PGPASSWORD: 
+        required: false
+        type: string
+        default: testing-password
+      POSTGRES_USER: 
+        required: false
+        type: string
+        default: user
+      POSTGRES_DB: 
+        required: false
+        type: string
+        default: test
+      POSTGRES_ENABLED:
+        required: false
+        type: string
+        default: "false"
+      POSTGRES_VERSION:
+        required: false
+        type: string
+        default: "11.21"
+      environment:
+        required: false
+        type: string
+        default: ''
+      submodules:
+        required: false
+        type: string
+        default: 'false'
+      PUBLIC_URL:
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch: {}
+  repository_dispatch:
+    types: [run]
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    environment: ${{ inputs.environment }}
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: ${{ inputs.submodules }}
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3 
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up tests herokuish and heroku buildpack
+        run: |
+          herokuish_base_image="${{ inputs.herokuish_base_image }}"
+          if [ "$herokuish_base_image"x = 'x' ]
+          then herokuish_base_image="gliderlabs/herokuish:latest-22"
+          fi
+          cat <<EOF > Dockerfile
+          FROM $herokuish_base_image
+          COPY . /tmp/app
+          ENV BUILDPACK_URL=${{ inputs.BUILDPACK_URL }} \\
+            USER=herokuishuser
+          EOF
+          rm -f .dockerignore
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ inputs.registry_root }}tests/${{ inputs.image_tagged || inputs.image_name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Create test services network
+        run: |
+          docker network create --internal test-services 
+      - if: inputs.POSTGRES_ENABLED == 'true'
+        name: Set up a test database container
+        run: |
+           # The following service is isolated from the internet
+           docker run -d --name postgres --network test-services -p 5432:5432 -e POSTGRES_DB=${{ inputs.POSTGRES_DB }} -e POSTGRES_USER=${{ inputs.POSTGRES_USER }} -e POSTGRES_PASSWORD=${{ inputs.PGPASSWORD }} postgres:${{ inputs.POSTGRES_VERSION }}-alpine
+           cat > psql-test.sh <<EOF
+           export PGPASSWORD=${{ inputs.PGPASSWORD }}
+           run=1
+           psql -h 127.0.0.1 -U user -d test -c \\q 2>/dev/null
+           while [ $? == 2 ]
+           do sleep 1
+              run=$(($run+1))
+              if [ $run -gt 59 ]; then break; fi
+              echo -n .
+              psql -h 127.0.0.1 -U user -d test -c \\q 2>/dev/null
+           done
+           EOF
+           bash psql-test.sh
+      - name: Restore cached buildpack versions
+        id: cache-buildpack-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            tmp/cache
+          key: ${{ runner.os }}-buildpack-cache
+      - name: Run tests using herokuish and heroku buildpack (DB credentials in multiple variables)
+        env:
+          SECRETS_CONTEXT: ${{ toJson(secrets) }}
+          VARS_CONTEXT: ${{ toJson(vars) }}
+          PUBLIC_URL: ${{ inputs.PUBLIC_URL }}
+# This is a bit more elaborate so the container has access to the internet via the host
+# and in addition to the test services network which is isolated from the internet
+        run: |
+          echo -n "$SECRETS_CONTEXT" | jq -r '[to_entries[]|select(.key|startswith("K8S_SECRET_"))]|map("\(.key|sub("K8S_SECRET_"; ""))=\(.value|tostring)")|.[]' > secrets.env
+          echo -n "$VARS_CONTEXT" | jq -r '[to_entries[]|select(.key|startswith("K8S_SECRET_"))]|map("\(.key|sub("K8S_SECRET_"; ""))=\(.value|tostring)")|.[]' >> secrets.env
+          echo -n "$VARS_CONTEXT" | jq -r '[to_entries[]|select(.key == "SERVICE_ID")]|map("\(.key)=\(.value|tostring)")|.[]' >> secrets.env
+          if [ "${PUBLIC_URL}x" == "x" ]
+          then echo -n "$VARS_CONTEXT" | jq -r '[to_entries[]|select(.key == "PUBLIC_URL")]|map("\(.key)=\(.value|tostring)")|.[]' >> secrets.env
+          else echo "PUBLIC_URL=$PUBLIC_URL" >> secrets.env 
+          fi
+          echo -n "$SECRETS_CONTEXT" | jq -r '[to_entries[]|select(.key|startswith("LC_K8S_SECRET_"))]|map("\(.key|sub("LC_K8S_SECRET_"; "")|ascii_downcase)=\(.value|tostring)")|.[]' >> secrets.env
+          echo -n "$VARS_CONTEXT" | jq -r '[to_entries[]|select(.key|startswith("LC_K8S_SECRET_"))]|map("\(.key|sub("LC_K8S_SECRET_"; "")|ascii_downcase)=\(.value|tostring)")|.[]' >> secrets.env
+          docker create -t --name test-run-step \
+            --env-file secrets.env \
+            -e POSTGRES_DB=${{ inputs.POSTGRES_DB }} \
+            -e POSTGRES_USER=${{ inputs.POSTGRES_USER }} \
+            -e POSTGRES_PASSWORD=${{ inputs.PGPASSWORD }} \
+            -e POSTGRES_HOST=postgres \
+            -e NODE_PORT=8080 \
+            -v $(pwd)/tmp/cache:/tmp/cache \
+            ${{ inputs.registry_root }}tests/${{ inputs.image_tagged || inputs.image_name }}:${{ github.sha }} \
+            /bin/herokuish buildpack test
+          docker network connect test-services test-run-step
+          docker start -i test-run-step
+      - name: Get test artifacts and clean up
+        if: always()
+        run: |
+          mkdir -p output
+          docker cp test-run-step:/app/cypress/ output > /dev/null 2>&1 || /bin/true
+          docker cp test-run-step:/app/playwright-report/ output > /dev/null 2>&1 || /bin/true
+          rm secrets.env
+          sudo chmod -R a+rX tmp          
+      - name: Save buildpack versions
+        if: always()
+        id: cache-buildpack-save
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            tmp/cache
+          key: ${{ steps.cache-buildpack-restore.outputs.cache-primary-key }}
+      - name: Store test artifacts
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-artifacts
+          path: output
